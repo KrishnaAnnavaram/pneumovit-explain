@@ -1,0 +1,32 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# data: X-ray images are never committed (see data/README.md)
+/data/*
+!/data/README.md
+
+# models, checkpoints, indexes and run outputs
+/models/
+/outputs/
+/reports/
+*.pt
+*.pth
+*.ckpt
+*.joblib
+*.pkl
+*.npz
+*.db
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+.streamlit/secrets.toml
