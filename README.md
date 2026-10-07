@@ -476,7 +476,7 @@ Read these problems before you use pneumovit-explain in production.
 | 6 | Threshold | A high target sensitivity lowers specificity (0.478 in the demo). | Choose the target with the clinical team. Report both thresholds |
 | 7 | Security | `explain` and the app load a `.joblib` file, and joblib can run code on load. | Load only bundles that you made |
 | 8 | Privacy | With `PNEUMOVIT_LLM_SEND_IMAGE=true`, the image goes to a third-party API. | Keep the default `false` for any real patient image |
-| 9 | Models | The pretrained timm backbones are implemented but not measured here (no GPU and no timm in this run). | Run `evaluate --model vit_small_dino` on a GPU before you choose a model |
+| 9 | Models | The pretrained timm backbones are implemented, but this README gives no measured result for them. | Run `evaluate --model vit_small_dino` on a GPU before you choose a model |
 | 10 | Fairness | No metrics per sex, age or site. | Dataset bias can stay hidden. Add subgroup metrics before research use on people |
 
 ---
