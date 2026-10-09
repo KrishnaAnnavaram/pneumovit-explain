@@ -70,6 +70,7 @@ This README is the **one location that explains all of pneumovit-explain**. It g
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one image](#42-the-life-cycle-of-one-image)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [The patient-aware split](#5-the-patient-aware-split)
 6. 🟢 [The classifiers, calibration and the threshold](#6-the-classifiers-calibration-and-the-threshold)
 7. 🟣 [The explanations](#7-the-explanations)
@@ -134,6 +135,54 @@ flowchart LR
 | App | `src/pneumovit_explain/app.py` | Streamlit page with a cached bundle and in-memory uploads |
 | CLI | `src/pneumovit_explain/cli.py` | The `pneumovit-explain` command with 7 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry points"]
+        CLI["cli.py<br/>pneumovit-explain command"]
+        APP["app.py<br/>Streamlit page, app extra"]
+    end
+    CFG["config.py<br/>Settings"]
+    subgraph DATAIN["Data in"]
+        DS["dataset.py<br/>scan, patient_split, load_gray"]
+        SYN["synthetic.py<br/>generate"]
+    end
+    subgraph MODELS["Classifiers and metrics"]
+        LIGHT["models.py<br/>LightClassifier, zone_slices"]
+        DEEP["deep.py<br/>TorchClassifier, attention_rollout"]
+        MET["metrics.py<br/>fit_temperature, threshold_for_sensitivity, bootstrap"]
+    end
+    PIPE["pipeline.py<br/>train_and_select, evaluate_test, Bundle"]
+    subgraph EXPL["Explanations"]
+        KNN["explain/knn.py<br/>TrainIndex"]
+        SAL["explain/saliency.py<br/>occlusion, top_zone"]
+        NAR["explain/narrative.py<br/>summarise, check_text"]
+    end
+    REP["report.py<br/>render, write"]
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> DS
+    CLI --> LIGHT
+    CLI --> DEEP
+    CLI --> PIPE
+    CLI --> REP
+    CLI --> NAR
+    CLI --> SAL
+    CLI -- "app" --> APP
+    APP --> CFG
+    APP --> PIPE
+    APP --> NAR
+    PIPE --> DS
+    PIPE --> MET
+    PIPE --> LIGHT
+    PIPE --> KNN
+    PIPE --> SAL
+    PIPE --> NAR
+    SAL --> LIGHT
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -167,6 +216,24 @@ pneumovit-explain/
 ### 3.1 The val part chooses, the test part measures
 `pipeline.train_and_select` reads only the train and val parts. It chooses the hyperparameters or the best epoch, fits the temperature and sets the threshold. A test records every image path that it reads and checks that no test-part image is among them.
 
+```mermaid
+flowchart LR
+    IDX[/"Index with the split column"/] --> TR["train part"]
+    IDX --> VA["val part"]
+    IDX --> TE["test part"]
+    TR --> FIT["classifier.fit"]
+    TR --> KNN["TrainIndex: train embeddings"]
+    VA --> SEL["choose C or the best epoch"]
+    FIT --> SEL
+    SEL --> TEMP["fit_temperature on val"]
+    TEMP --> THR["threshold_for_sensitivity on val"]
+    THR --> BUN["Bundle"]
+    KNN --> BUN
+    BUN --> EV["evaluate_test: one pass"]
+    TE --> EV
+    EV --> OUT[/"report.md, results.json"/]
+```
+
 ### 3.2 The served model is the selected model
 `train_and_select` returns one bundle with the selected weights. `save_bundle` writes it, and the CLI and the app load that file. Deep training restores the best-validation weights before it saves the checkpoint.
 
@@ -195,8 +262,9 @@ No image goes to an LLM unless `PNEUMOVIT_LLM_SEND_IMAGE=true`. The app keeps up
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    SCAN["scan: files, patients, subtypes"] --> SPL["patient_split: train / val / test"]
+flowchart TD
+    SRC[/"Kermany folder or synthetic images"/] --> SCAN["scan: files, patients, subtypes"]
+    SCAN --> SPL["patient_split: train / val / test"]
     SPL --> TR["train part"]
     SPL --> VA["val part"]
     SPL --> TE["test part"]
@@ -206,15 +274,53 @@ flowchart TB
     SEL --> CAL["temperature on val logits"]
     CAL --> THR["threshold for val sensitivity >= 0.95"]
     TR --> IDX["neighbour index (both classes)"]
-    THR --> BUN["bundle"]
+    THR --> BUN[("bundle.joblib")]
     IDX --> BUN
     BUN --> EVAL["one test pass: metrics + patient bootstrap CIs"]
     TE --> EVAL
-    BUN --> AN["analyze(image): probability, flag, neighbours, saliency, summary"]
-    AN --> LLM["optional LLM: facts only, checked"]
+    EVAL --> REP[/"report.md, results.json"/]
+    IMG[/"one X-ray image"/] --> AN["analyze(image): probability, flag, neighbours, saliency"]
+    BUN --> AN
+    AN --> LLM{"LLM provider set?"}
+    LLM -- "no" --> TPL[/"template summary + banner"/]
+    LLM -- "yes" --> CHK{"checker finds a problem?"}
+    CHK -- "yes" --> TPL
+    CHK -- "no" --> SUM[/"LLM summary + banner"/]
+    SUM --> HUMAN{{"HUMAN<br/>a clinician makes every clinical decision"}}
+    TPL --> HUMAN
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one image
+
+```mermaid
+stateDiagram-v2
+    state "Uploaded or read image" as Input
+    state "Grey image at the bundle size" as Resized
+    state "Calibrated probability" as Probability
+    state "Above threshold" as Flagged
+    state "Below threshold" as NotFlagged
+    state "Neighbours and saliency" as Evidence
+    state "Template summary" as Template
+    state "LLM text checked" as Checked
+    state "Summary with banner" as Final
+    state "Clinician review" as Review
+    [*] --> Input: app upload or explain command
+    Input --> Resized: decode in memory, grey, resize
+    Resized --> Probability: logit divided by the temperature, sigmoid
+    Probability --> Flagged: p at or above the threshold
+    Probability --> NotFlagged: p below the threshold
+    Flagged --> Evidence: TrainIndex.query, occlusion
+    NotFlagged --> Evidence: TrainIndex.query, occlusion
+    Evidence --> Template: facts_from, template
+    Template --> Checked: LLM provider set
+    Template --> Final: no LLM provider
+    Checked --> Final: accepted, or rejected and the template kept
+    Final --> Review
+    Review --> [*]
+```
 
 1. The app or the CLI decodes the image in memory and resizes it to the bundle size.
 2. The classifier gives a logit. The temperature turns it into a calibrated probability.
@@ -224,11 +330,64 @@ flowchart TB
 6. The template writes the summary from the facts. An optional LLM rewrites it, and the checker accepts or rejects the text.
 7. The output ends with the banner. No file is written unless you ask for an overlay.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor RV as Reviewer
+    participant APP as Streamlit app
+    participant B as Bundle
+    participant CLF as Classifier
+    participant IDX as TrainIndex
+    participant SAL as saliency
+    participant NAR as narrative
+    participant LLM as LLM API, optional
+
+    RV->>APP: pneumovit-explain app with the bundle path
+    APP->>B: load_bundle, cached one time
+    RV->>APP: upload a PNG or JPEG
+    APP->>B: analyze(img, k, client, send_image)
+    B->>CLF: logits, then divide by the temperature
+    CLF-->>B: calibrated probability and flag
+    B->>CLF: embed(img)
+    B->>IDX: query(vector, k)
+    IDX-->>B: neighbours of both classes
+    B->>SAL: occlusion(logits, img), top_zone
+    SAL-->>B: heat map and strongest zone
+    B->>NAR: summarise(result)
+    NAR->>NAR: facts_from, template
+    NAR->>LLM: build_prompt with facts, no label, no image by default
+    LLM-->>NAR: candidate text
+    NAR->>NAR: check_text, keep the template on a problem
+    NAR-->>B: summary with banner
+    B-->>APP: result
+    APP-->>RV: probability, flag, neighbours, heat map, summary
+```
+
 ---
 
 ## 5. The patient-aware split
 
 **Purpose.** Separate the images that choose the model from the images that measure it, with no patient in two parts.
+
+```mermaid
+flowchart TD
+    ROOT[/"root/train, val, test<br/>NORMAL, PNEUMONIA"/] --> SCAN["scan: each .jpeg, .jpg, .png"]
+    SCAN --> DEC{"image decodes?"}
+    DEC -- "no" --> ERR[/"DatasetError, the run stops"/]
+    DEC -- "yes" --> PP["parse_patient<br/>person, IM or NORMAL2-IM name"]
+    PP --> KNOWN{"patient ID in<br/>the file name?"}
+    KNOWN -- "no" --> OWN["own patient, warning"]
+    OWN --> POOL["pool all official parts"]
+    KNOWN -- "yes" --> POOL
+    POOL --> BOTH{"both classes?"}
+    BOTH -- "no" --> ERR
+    BOTH -- "yes" --> TEST["take the test part<br/>StratifiedGroupKFold by patient"]
+    TEST --> VAL["take the val part<br/>from the rest, by patient"]
+    VAL --> CHECK["check: each patient in one part"]
+    CHECK --> OUT[/"Index: patient, subtype,<br/>official_split, split"/]
+```
 
 | Input | Output |
 |---|---|
@@ -253,6 +412,58 @@ flowchart TB
 ## 6. The classifiers, calibration and the threshold
 
 **Purpose.** Fit a model, choose it on the val part, and turn its output into a calibrated probability and a flag.
+
+```mermaid
+flowchart TD
+    IDX[/"Index"/] --> LD["load_images: train and val<br/>grey, image size"]
+    LD --> FIT["classifier.fit(train, val)"]
+    FIT --> ZV["logits on val"]
+    ZV --> T["fit_temperature<br/>minimum val log loss"]
+    T --> PV["calibrated val probabilities"]
+    PV --> TH["threshold_for_sensitivity<br/>PNEUMOVIT_TARGET_SENSITIVITY"]
+    LD --> EMB["embed the train images"]
+    EMB --> KNN["TrainIndex<br/>both classes"]
+    TH --> VS["val summary"]
+    VS --> B[/"Bundle: classifier, temperature,<br/>threshold, index, val summary"/]
+    KNN --> B
+    B --> SAVE[("models/bundle.joblib")]
+```
+
+```mermaid
+flowchart LR
+    IMG[/"grey image"/] --> H["intensity histogram<br/>16 bins"]
+    IMG --> Z["6 lung zones:<br/>mean, spread, texture"]
+    IMG --> G["gradient histogram<br/>8 bins"]
+    IMG --> TH["8 x 8 thumbnail"]
+    H --> F["106 features"]
+    Z --> F
+    G --> F
+    TH --> F
+    F --> SC["StandardScaler, fit on train"]
+    SC --> LR["LogisticRegression, balanced,<br/>for C in 0.01, 0.1, 1, 10"]
+    LR --> AUC{"highest val AUC"}
+    AUC --> OUT[/"selected model:<br/>logits and embeddings"/]
+```
+
+```mermaid
+flowchart TD
+    BLD{"model name"} -- "vit_scratch" --> VIT["build_vit<br/>1 channel, CLS token"]
+    BLD -- "timm backbone" --> TIMM["timm.create_model<br/>pretrained, 3 channels"]
+    VIT --> DEV["pick_device<br/>CPU if CUDA is missing"]
+    TIMM --> DEV
+    DEV --> EP["one epoch: AdamW, BCE with pos_weight,<br/>shifts, brightness, contrast"]
+    EP --> SCH["cosine schedule step"]
+    SCH --> VAUC["val AUC"]
+    VAUC --> BEST{"better than the best?"}
+    BEST -- "yes" --> KEEP["keep the weights"]
+    BEST -- "no" --> PAT{"patience 5 reached?"}
+    KEEP --> MORE{"more epochs?"}
+    PAT -- "no" --> MORE
+    MORE -- "yes" --> EP
+    PAT -- "yes" --> REST["restore the best weights"]
+    MORE -- "no" --> REST
+    REST --> OUT[/"fitted TorchClassifier,<br/>weights go into the bundle"/]
+```
 
 | Input | Output |
 |---|---|
@@ -288,6 +499,56 @@ flowchart TB
 
 **Purpose.** Show evidence for and against the flag that does not come from the flag itself.
 
+```mermaid
+flowchart TD
+    IMG[/"image and bundle"/] --> PRE["grey, scale to 0 to 1,<br/>resize to the bundle size"]
+    PRE --> P["probability: sigmoid of logit / T"]
+    P --> FLAG{"p >= threshold?"}
+    FLAG -- "yes" --> F1["above threshold: review for pneumonia"]
+    FLAG -- "no" --> F0["below threshold"]
+    PRE --> NB["TrainIndex.query<br/>top PNEUMOVIT_K_NEIGHBOURS"]
+    PRE --> OCC["saliency.occlusion<br/>8 x 8 patches, stride 4"]
+    OCC --> TZ["top_zone"]
+    NB --> FACTS["facts_from"]
+    TZ --> FACTS
+    P --> FACTS
+    FACTS --> SUM["narrative.summarise"]
+    F1 --> OUT[/"result: probability, flag, neighbours,<br/>zone, summary, banner"/]
+    F0 --> OUT
+    SUM --> OUT
+```
+
+```mermaid
+flowchart LR
+    IMG[/"image"/] --> BL["gaussian blur copy<br/>sigma = patch size"]
+    IMG --> BASE["base logit"]
+    BL --> LOOP["for each 8 x 8 patch, stride 4:<br/>replace the patch with the blurred copy"]
+    LOOP --> SC["logits of all occluded images"]
+    BASE --> DROP["drop = base - occluded logit,<br/>averaged for each pixel"]
+    SC --> DROP
+    DROP --> ZS["zone_scores: mean positive drop<br/>in each of the 6 lung zones"]
+    ZS --> TOP[/"strongest zone and its share"/]
+```
+
+```mermaid
+flowchart TD
+    R[/"result"/] --> F["facts_from: probability, threshold,<br/>neighbour counts, zone, share"]
+    F --> T["template text"]
+    T --> C{"LLM client set?"}
+    C -- "no" --> OUT[/"text + banner, source,<br/>rejected_because, facts"/]
+    C -- "yes" --> IMGQ{"PNEUMOVIT_LLM_SEND_IMAGE?"}
+    IMGQ -- "true" --> PNG["add the image as PNG"]
+    PNG --> PROMPT["build_prompt: facts and template,<br/>no predicted label"]
+    IMGQ -- "false" --> PROMPT
+    PROMPT --> GEN["client.generate<br/>fake, gemini or openai"]
+    GEN -- "error" --> KEEP["keep the template,<br/>record the error type"]
+    GEN --> CHK{"check_text: certainty word<br/>or new number?"}
+    CHK -- "yes" --> KEEP
+    CHK -- "no" --> USE["use the LLM text"]
+    KEEP --> OUT
+    USE --> OUT
+```
+
 | Input | Output |
 |---|---|
 | One image and the bundle | Neighbours with labels, a saliency map, the strongest lung zone, a checked summary |
@@ -296,7 +557,7 @@ flowchart TB
 
 1. Query the neighbour index with the image embedding. Return the top `PNEUMOVIT_K_NEIGHBOURS` (default 10) with labels.
 2. Replace each 8 x 8 patch (stride 4) with a blurred copy and record the logit drop.
-3. Sum the positive drop in each of the six lung zones. Name the zone with the largest share.
+3. Calculate the mean positive drop in each of the six lung zones. Name the zone with the largest share.
 4. Write the template summary from the facts.
 5. If an LLM provider is set, send the facts and the template. Accept the answer only if the checker finds no problem.
 6. Append the banner.
@@ -312,6 +573,19 @@ flowchart TB
 
 ## 8. The metrics and the safety rules
 
+```mermaid
+flowchart LR
+    TE[/"test part, read one time"/] --> P["bundle.probability"]
+    P --> OP["summary at the operating threshold"]
+    P --> HALF["summary at 0.5"]
+    P --> BS["bootstrap over patients<br/>AUC, sensitivity, specificity"]
+    P --> SUB["share flagged per subtype"]
+    OP --> REC[/"test record in results.json"/]
+    HALF --> REC
+    BS --> REC
+    SUB --> REC
+```
+
 | Metric | Meaning |
 |---|---|
 | AUC | Ranking quality over all thresholds |
@@ -322,6 +596,21 @@ flowchart TB
 | Share flagged per subtype | Flag rate for bacteria, virus and normal test images |
 | Randomisation check | Spearman correlation of saliency maps: trained model vs. shuffled-label model |
 | Zone agreement | Share of synthetic focal findings where the strongest zone is the true zone (chance 1/6) |
+
+The two saliency checks run in `evaluate`:
+
+```mermaid
+flowchart TD
+    B[/"bundle"/] --> SCQ{"--sanity-check and<br/>light classifier?"}
+    SCQ -- "no" --> SKIP[/"no randomisation check"/]
+    SCQ -- "yes" --> RND["fit LightClassifier<br/>on shuffled labels"]
+    RND --> MAPS["occlusion maps of 5 val images:<br/>trained and shuffled model"]
+    MAPS --> RHO[/"Spearman: mean and max"/]
+    B --> META{"metadata.csv in<br/>the data folder?"}
+    META -- "yes, synthetic data" --> ZA["zone_agreement on test images<br/>with a focal finding"]
+    ZA --> AG[/"agreement, chance 1/6"/]
+    META -- "no" --> NONE[/"no zone agreement"/]
+```
 
 | Safety rule | Value in the code |
 |---|---|
@@ -340,7 +629,7 @@ flowchart TB
 | `data/README.md` | Yes | Source, license, layout, patient IDs, privacy |
 | `data/chest_xray/**` | No (git ignores it) | X-ray images |
 | `models/bundle.joblib` | No (git ignores it) | The selected classifier, temperature, threshold and neighbour index |
-| `models/*.pt`, `models/*.json` | No (git ignores it) | Deep checkpoints with the best epoch |
+| `models/*.pt`, `models/*.json` | No (git ignores it) | Deep checkpoints with the best epoch. Only `TorchClassifier.save` writes them. The CLI keeps the deep weights in the bundle |
 | `outputs/report.md`, `outputs/results.json` | No (git ignores it) | Evaluation results |
 | `outputs/*.png` | No (git ignores it) | Saliency overlays |
 | `.env` | No (git ignores it) | Local settings and API keys |
@@ -401,11 +690,31 @@ pytest -q
 | `pneumovit-explain explain` | Prints the JSON result for one image, writes an overlay with `--overlay` |
 | `pneumovit-explain app` | Starts the Streamlit app with the bundle |
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> SY["pneumovit-explain synth"]
+    INS --> DL[/"Kermany folder<br/>see data/README.md"/]
+    SY --> DATA[("chest_xray folder,<br/>metadata.csv for synthetic data")]
+    DL --> DATA
+    DATA --> IX["pneumovit-explain index"]
+    DATA --> TR["pneumovit-explain train"]
+    TR --> BUN[("models/bundle.joblib")]
+    BUN --> EV["pneumovit-explain evaluate --bundle"]
+    DATA --> EV
+    EV --> REP[("outputs/report.md,<br/>results.json")]
+    BUN --> EX["pneumovit-explain explain"]
+    EX --> OV[("overlay PNG")]
+    BUN --> APP["pneumovit-explain app"]
+    INS --> DEMO["pneumovit-explain demo<br/>synthetic, light classifier, sanity check"]
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
 |---|---|---|
-| `PNEUMOVIT_DATA_DIR` | index | Kermany folder |
+| `PNEUMOVIT_DATA_DIR` | index, train, evaluate | Kermany folder |
 | `PNEUMOVIT_OUTPUT_DIR` | report | Output folder (default `outputs`) |
 | `PNEUMOVIT_MODEL_DIR` | train, app | Bundle folder (default `models`) |
 | `PNEUMOVIT_BUNDLE` | app | Bundle path for the app (the `app` command sets it) |
@@ -425,6 +734,18 @@ pytest -q
 | `OPENAI_API_KEY` | summary | Key for the OpenAI-compatible API |
 
 Credentials are only in a local `.env` file or the environment. Git ignores `.env`. Do not print or commit credentials.
+
+```mermaid
+flowchart LR
+    DOT[/".env file, optional"/] --> FE["Settings.from_env<br/>the process environment wins"]
+    ENV[/"process environment<br/>and API keys"/] --> FE
+    FE --> CHK{"ranges and<br/>LLM provider valid?"}
+    CHK -- "no" --> ERR[/"ConfigError, exit code 2"/]
+    CHK -- "yes" --> SET["Settings<br/>keys kept out of repr"]
+    CLI[/"command-line options"/] --> OV["with_overrides"]
+    SET --> OV
+    OV --> MC["narrative.make_client<br/>none, fake, gemini or openai"]
+```
 
 ---
 
